@@ -369,13 +369,18 @@ function Invoke-AICall {
     } else {
         $aiBody["max_tokens"] = $MaxTokens
     }
-    $aiBody = $aiBody | ConvertTo-Json -Depth 5
+    $jsonBody = $aiBody | ConvertTo-Json -Depth 5 -EscapeHandling EscapeNonAscii
+    $utf8Body = [System.Text.Encoding]::UTF8.GetBytes($jsonBody)
 
     $apiVersion = if ($AzureOpenAIDeployment -match "gpt-5|o4|codex") { "2025-04-01-preview" } else { "2024-02-15-preview" }
     $uri = "$AzureOpenAIEndpoint/openai/deployments/$AzureOpenAIDeployment/chat/completions?api-version=$apiVersion"
 
-    $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $authHeaders -Body $aiBody -TimeoutSec 120
-    return $response.choices[0].message.content
+    $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $authHeaders -Body $utf8Body -ContentType "application/json; charset=utf-8" -TimeoutSec 120
+    $content = $response.choices[0].message.content
+    if (-not $content -or $content.Length -eq 0) {
+        Write-Warn "AI returned empty response (finish_reason: $($response.choices[0].finish_reason))"
+    }
+    return $content
 }
 
 function Get-PackageContext {

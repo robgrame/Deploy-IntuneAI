@@ -1141,15 +1141,18 @@ function Deploy-ToIntune {
 "@
     $manifestB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($manifestXml))
 
-    # Create content file
+    # Create content file (manifest only for MSI-based apps per Graph API requirement)
     $cfBody = @{
         "@odata.type"  = "#microsoft.graph.mobileAppContentFile"
         name           = $Manifest.Install.SetupFile
         size           = [int64]$fileSize
         sizeEncrypted  = [int64]$encSize
-        manifest       = $manifestB64
         isDependency   = $false
-    } | ConvertTo-Json
+    }
+    if ($Manifest.Install.SetupFile -match '\.msi$') {
+        $cfBody["manifest"] = $manifestB64
+    }
+    $cfBody = $cfBody | ConvertTo-Json
     $cf = Invoke-MgGraphRequest -Method POST `
         -Uri "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
         -Body $cfBody -ContentType "application/json"

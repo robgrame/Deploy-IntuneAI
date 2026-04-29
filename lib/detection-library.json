@@ -1,0 +1,297 @@
+{
+  "description": "Library of Intune Win32 app detection rule templates and requirement patterns for the Graph API",
+  "version": "1.0",
+
+  "detectionRules": {
+    "registry": {
+      "description": "Detect app by checking a registry key/value exists or has a specific value",
+      "graphOdataType": "#microsoft.graph.win32LobAppRegistryRule",
+      "validOperationTypes": ["notConfigured", "exists", "doesNotExist", "string", "integer", "version"],
+      "validOperators": ["notConfigured", "equal", "notEqual", "greaterThan", "greaterThanOrEqual", "lessThan", "lessThanOrEqual"],
+      "keyPathFormat": "HKEY_LOCAL_MACHINE\\... or HKEY_CURRENT_USER\\...",
+      "templates": [
+        {
+          "name": "registry-exists",
+          "description": "Check if a registry value exists (any value)",
+          "when": "The installer creates a registry key/value as a side effect",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\<Vendor>\\<Product>",
+            "valueName": "<ValueName>",
+            "operationType": "exists",
+            "operator": "notConfigured",
+            "comparisonValue": null
+          }
+        },
+        {
+          "name": "registry-integer-equal",
+          "description": "Check if a DWORD registry value equals a specific number",
+          "when": "The installer sets a DWORD value (e.g., Enabled=1, AllowTelemetry=1)",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\<Area>",
+            "valueName": "<ValueName>",
+            "operationType": "integer",
+            "operator": "equal",
+            "comparisonValue": "1"
+          }
+        },
+        {
+          "name": "registry-version-gte",
+          "description": "Check if a version string is >= a threshold",
+          "when": "The app writes its version to registry (common for MSI and some EXEs)",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\<Vendor>\\<Product>",
+            "valueName": "Version",
+            "operationType": "version",
+            "operator": "greaterThanOrEqual",
+            "comparisonValue": "1.0.0"
+          }
+        },
+        {
+          "name": "registry-string-equal",
+          "description": "Check if a string registry value matches exactly",
+          "when": "The app writes a configuration string that confirms installation",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\<Vendor>\\<Product>",
+            "valueName": "<ValueName>",
+            "operationType": "string",
+            "operator": "equal",
+            "comparisonValue": "<ExpectedString>"
+          }
+        },
+        {
+          "name": "registry-uninstall-key",
+          "description": "Check Uninstall registry key (standard for MSI/EXE installers)",
+          "when": "App registers in Add/Remove Programs",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ProductCode}",
+            "valueName": "DisplayVersion",
+            "operationType": "version",
+            "operator": "greaterThanOrEqual",
+            "comparisonValue": "1.0.0"
+          }
+        },
+        {
+          "name": "registry-custom-marker",
+          "description": "Detection via a custom marker key written by a wrapper script",
+          "when": "No native detection artifact exists; wrapper script writes a marker after successful install",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppRegistryRule",
+            "ruleType": "detection",
+            "check32BitOn64System": false,
+            "keyPath": "HKEY_LOCAL_MACHINE\\SOFTWARE\\IntuneApps\\<AppName>",
+            "valueName": "Installed",
+            "operationType": "integer",
+            "operator": "equal",
+            "comparisonValue": "1"
+          }
+        }
+      ]
+    },
+
+    "file": {
+      "description": "Detect app by checking if a file or folder exists, or a file version/size/date",
+      "graphOdataType": "#microsoft.graph.win32LobAppFileSystemRule",
+      "validOperationTypes": ["notConfigured", "exists", "doesNotExist", "string", "integer", "version", "sizeInMB", "dateModified", "dateCreated"],
+      "templates": [
+        {
+          "name": "file-exists",
+          "description": "Check if a specific file exists at a known path",
+          "when": "The installer copies an EXE/DLL to a known location",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppFileSystemRule",
+            "ruleType": "detection",
+            "path": "C:\\Program Files\\<Vendor>\\<Product>",
+            "fileOrFolderName": "<app>.exe",
+            "check32BitOn64System": false,
+            "operationType": "exists"
+          }
+        },
+        {
+          "name": "file-version-gte",
+          "description": "Check file version is >= a threshold",
+          "when": "Need to detect a specific version of an installed EXE/DLL",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppFileSystemRule",
+            "ruleType": "detection",
+            "path": "C:\\Program Files\\<Vendor>\\<Product>",
+            "fileOrFolderName": "<app>.exe",
+            "check32BitOn64System": false,
+            "operationType": "version",
+            "operator": "greaterThanOrEqual",
+            "comparisonValue": "1.0.0.0"
+          }
+        },
+        {
+          "name": "folder-exists",
+          "description": "Check if an installation folder exists",
+          "when": "The installer creates a unique directory structure",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppFileSystemRule",
+            "ruleType": "detection",
+            "path": "C:\\Program Files\\<Vendor>",
+            "fileOrFolderName": "<Product>",
+            "check32BitOn64System": false,
+            "operationType": "exists"
+          }
+        },
+        {
+          "name": "file-marker",
+          "description": "Check for a marker file created by a wrapper script",
+          "when": "Wrapper script creates a file to signal successful installation",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppFileSystemRule",
+            "ruleType": "detection",
+            "path": "C:\\ProgramData\\IntuneApps\\<AppName>",
+            "fileOrFolderName": "installed.tag",
+            "check32BitOn64System": false,
+            "operationType": "exists"
+          }
+        }
+      ]
+    },
+
+    "productCode": {
+      "description": "Detect MSI app by ProductCode GUID",
+      "graphOdataType": "#microsoft.graph.win32LobAppProductCodeRule",
+      "templates": [
+        {
+          "name": "msi-product-code",
+          "description": "Detect MSI installation by ProductCode and minimum version",
+          "when": "Package contains an MSI with extractable ProductCode",
+          "template": {
+            "@odata.type": "#microsoft.graph.win32LobAppProductCodeRule",
+            "ruleType": "detection",
+            "productCode": "{GUID-FROM-MSI}",
+            "productVersionOperator": "greaterThanOrEqual",
+            "productVersion": "1.0.0"
+          }
+        }
+      ]
+    },
+
+    "script": {
+      "description": "Detect app using a custom PowerShell detection script (exit code 0 = detected)",
+      "graphOdataType": "#microsoft.graph.win32LobAppPowerShellScriptRule",
+      "notes": "Script must exit 0 if app is detected, non-zero if not. stdout is also evaluated.",
+      "templates": [
+        {
+          "name": "script-registry-check",
+          "description": "PowerShell script that checks a registry value with custom logic",
+          "when": "Detection requires complex logic (multiple conditions, value parsing)",
+          "scriptTemplate": "$regPath = 'HKLM:\\SOFTWARE\\<Vendor>\\<Product>'\nif (Test-Path $regPath) {\n    $val = Get-ItemPropertyValue -Path $regPath -Name '<ValueName>' -ErrorAction SilentlyContinue\n    if ($val -eq '<ExpectedValue>') {\n        Write-Output 'Detected'\n        exit 0\n    }\n}\nexit 1"
+        },
+        {
+          "name": "script-multi-condition",
+          "description": "PowerShell script that checks multiple conditions (AND logic)",
+          "when": "Detection requires verifying multiple artifacts together",
+          "scriptTemplate": "$checks = @()\n$checks += Test-Path 'C:\\Program Files\\<Product>\\<app>.exe'\n$checks += (Get-ItemPropertyValue -Path 'HKLM:\\SOFTWARE\\<Vendor>\\<Product>' -Name 'Version' -ErrorAction SilentlyContinue) -ge '<MinVersion>'\nif ($checks -notcontains $false) {\n    Write-Output 'Detected'\n    exit 0\n}\nexit 1"
+        },
+        {
+          "name": "script-service-check",
+          "description": "PowerShell script that checks if a Windows service exists",
+          "when": "The installer creates a Windows service",
+          "scriptTemplate": "$svc = Get-Service -Name '<ServiceName>' -ErrorAction SilentlyContinue\nif ($svc -and $svc.StartType -ne 'Disabled') {\n    Write-Output 'Detected'\n    exit 0\n}\nexit 1"
+        },
+        {
+          "name": "script-config-validation",
+          "description": "PowerShell script that validates a configuration was applied correctly",
+          "when": "Package is a configuration script; detection must verify the outcome",
+          "scriptTemplate": "$allGood = $true\n$checks = @(\n    @{Path='HKLM:\\SOFTWARE\\Policies\\<Area>';Name='<Setting1>';Expected=1},\n    @{Path='HKLM:\\SOFTWARE\\Policies\\<Area>';Name='<Setting2>';Expected=1}\n)\nforeach ($c in $checks) {\n    $val = Get-ItemPropertyValue -Path $c.Path -Name $c.Name -ErrorAction SilentlyContinue\n    if ($val -ne $c.Expected) { $allGood = $false; break }\n}\nif ($allGood) { Write-Output 'Detected'; exit 0 }\nexit 1"
+        }
+      ]
+    }
+  },
+
+  "requirements": {
+    "operatingSystem": {
+      "graphField": "minimumSupportedOperatingSystem",
+      "validValues": {
+        "v10_1607": "Windows 10 1607 (Anniversary Update)",
+        "v10_1703": "Windows 10 1703 (Creators Update)",
+        "v10_1709": "Windows 10 1709 (Fall Creators Update)",
+        "v10_1803": "Windows 10 1803 (April 2018 Update)",
+        "v10_1809": "Windows 10 1809 (October 2018 Update)",
+        "v10_1903": "Windows 10 1903 (May 2019 Update)",
+        "v10_1909": "Windows 10 1909 (November 2019 Update)",
+        "v10_2004": "Windows 10 2004 (May 2020 Update)",
+        "v10_2H20": "Windows 10 20H2 (October 2020 Update)",
+        "v10_21H1": "Windows 10 21H1 (May 2021 Update)",
+        "v10_21H2": "Windows 10 21H2 (November 2021 Update)",
+        "v10_22H2": "Windows 10 22H2 (October 2022 Update)",
+        "w11_21H2": "Windows 11 21H2",
+        "w11_22H2": "Windows 11 22H2",
+        "w11_23H2": "Windows 11 23H2",
+        "w11_24H2": "Windows 11 24H2"
+      }
+    },
+    "architecture": {
+      "validValues": ["x64", "x86", "arm64", "all"],
+      "guidance": {
+        "x64": "Most modern apps. Use when app has x64-specific binaries",
+        "x86": "Legacy 32-bit apps only",
+        "arm64": "ARM64 native apps (Surface Pro X, etc.)",
+        "all": "Architecture-neutral (scripts, Java apps, web apps)"
+      }
+    },
+    "customRequirements": [
+      {
+        "name": "disk-space",
+        "graphOdataType": "#microsoft.graph.win32LobAppFileSystemRequirement",
+        "description": "Require minimum free disk space"
+      },
+      {
+        "name": "dotnet-framework",
+        "graphOdataType": "#microsoft.graph.win32LobAppRegistryRequirement",
+        "description": "Require .NET Framework version",
+        "knownValues": {
+          "528040": ".NET 4.8",
+          "461808": ".NET 4.7.2",
+          "394802": ".NET 4.6.2"
+        }
+      },
+      {
+        "name": "domain-joined",
+        "graphOdataType": "#microsoft.graph.win32LobAppPowerShellScriptRequirement",
+        "description": "Require device is AD domain-joined"
+      },
+      {
+        "name": "aad-joined",
+        "graphOdataType": "#microsoft.graph.win32LobAppPowerShellScriptRequirement",
+        "description": "Require device is Azure AD joined"
+      }
+    ]
+  },
+
+  "bestPractices": {
+    "detection": [
+      "Always verify detection rules check OUTCOMES, not prerequisites",
+      "For MSI: ProductCode is the most reliable detection method",
+      "For EXE: file version check is more reliable than file-exists",
+      "For scripts: use a custom marker (registry or file) written by a wrapper",
+      "Never use generic OS keys like HKLM\\Hardware",
+      "Test detection on both clean and already-configured machines",
+      "For 32-bit apps on 64-bit OS, set check32BitOn64System to true"
+    ],
+    "requirements": [
+      "Set minimum OS to the lowest version the app actually supports",
+      "Use 'all' architecture for scripts and interpreted apps",
+      "Add disk space requirements for large installations (>500MB)",
+      "Consider domain-join or AAD-join requirements for enterprise scripts"
+    ]
+  }
+}

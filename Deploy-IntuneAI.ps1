@@ -480,25 +480,35 @@ Return your plan as a JSON object:
 function Invoke-AICoding {
     param([hashtable]$Plan, [hashtable]$Manifest)
 
+    # Load detection library for the AI to reference
+    $libPath = Join-Path (Split-Path $PSCommandPath) "lib\detection-library.json"
+    $detectionLibrary = ""
+    if (Test-Path $libPath) {
+        $detectionLibrary = Get-Content $libPath -Raw
+    }
+
     $systemPrompt = @"
 You are a senior Intune packaging engineer. Based on the analysis plan provided, produce the FINAL packaging configuration.
 
-## Critical rules for detection:
-- Detection rules must verify the OUTCOME of the installation, not prerequisites
-- Prefer the detection candidate with the highest reliability from the plan
-- NEVER use generic OS registry keys (like HKLM\Hardware) — these always exist
-- keyPath must use full format: HKEY_LOCAL_MACHINE\... (not HKLM:\...)
-- For integer comparison: operationType is "integer", NOT "integerComparison"
-- Valid operationType values: exists, doesNotExist, string, integer, version
-- Valid operator values: notConfigured, equal, notEqual, greaterThan, greaterThanOrEqual, lessThan, lessThanOrEqual
+## DETECTION RULES LIBRARY — Use these exact templates and valid values:
+$detectionLibrary
 
-## Critical rules for install commands:
+## Rules:
+- Pick the template that best matches the detection strategy from the plan
+- Fill in the template placeholders with actual values from the package analysis
+- Use ONLY the valid operationType and operator values listed in the library
+- keyPath must use full format: HKEY_LOCAL_MACHINE\... (not HKLM:\...)
+- For configuration scripts with no native artifact: use "registry-custom-marker" or "script-config-validation" template
+- For MSI packages: always prefer "msi-product-code" template
+- For EXE installers: prefer "file-version-gte" or "registry-uninstall-key" template
+
+## Install command rules:
 - .bat/.cmd → cmd.exe /c <filename>
 - .ps1 → powershell.exe -ExecutionPolicy Bypass -File <filename>
 - .msi → msiexec /i <filename> /qn /norestart
 - If a .bat launcher calls a .ps1 script, the .bat is the entry point
 
-## Critical rules for uninstall:
+## Uninstall rules:
 - If no uninstall exists: cmd.exe /c echo No uninstall available
 - Never invent an uninstall that doesn't exist
 "@
@@ -519,20 +529,23 @@ $($Manifest | ConvertTo-Json -Depth 5)
   "description": "What this package does (1-2 sentences)",
   "installCommandLine": "Exact silent install command",
   "uninstallCommandLine": "Exact uninstall command or placeholder",
-  "detectionType": "registry|file|productCode",
+  "detectionType": "registry|file|productCode|script",
+  "detectionTemplateName": "Name of the template from the library that was used (e.g. registry-integer-equal)",
   "detectionRules": [
     {
-      "type": "registry",
+      "type": "registry|file|productCode",
       "keyPath": "HKEY_LOCAL_MACHINE\\full\\path",
       "valueName": "ValueName",
       "operator": "exists|equal|greaterThanOrEqual",
       "comparisonValue": "if applicable"
     }
   ],
-  "minOS": "1803|1903|21H2|22H2",
-  "architecture": "x64|x86|all",
+  "detectionScript": "If detectionType is script, the full PowerShell detection script content. null otherwise.",
+  "minOS": "v10_1803|v10_1903|v10_21H2|v10_22H2|w11_22H2",
+  "architecture": "x64|x86|arm64|all",
+  "customRequirements": ["disk-space|dotnet-framework|domain-joined|aad-joined or null"],
   "confidence": "high|medium|low",
-  "selectedDetectionJustification": "Why this detection rule was chosen over alternatives"
+  "selectedDetectionJustification": "Why this detection rule and template was chosen over alternatives"
 }
 "@
 
@@ -879,10 +892,10 @@ function Build-AIReport {
     
     # Get pipeline context for rich reporting
     $pipelineCtx = $Manifest._PipelineContext
-    $planJson = if ($pipelineCtx.Plan) { $pipelineCtx.Plan | ConvertTo-Json -Depth 5 } else { "Not available" }
-    $codeJson = if ($pipelineCtx.CodeResult) { $pipelineCtx.CodeResult | ConvertTo-Json -Depth 5 } else { "Not available" }
-    $reviewJson = if ($pipelineCtx.Review) { $pipelineCtx.Review | ConvertTo-Json -Depth 5 } else { "Not available" }
-    $sanityIssues = if ($pipelineCtx.SanityIssues) { $pipelineCtx.SanityIssues -join "`n- " } else { "None" }
+    $planJson = if ($pipelineCtx.Plan) { try { $pipelineCtx.Plan | ConvertTo-Json -Depth 3 -Compress } catch { "Plan serialization failed" } } else { "Not available" }
+    $codeJson = if ($pipelineCtx.CodeResult) { try { $pipelineCtx.CodeResult | ConvertTo-Json -Depth 3 -Compress } catch { "Code serialization failed" } } else { "Not available" }
+    $reviewJson = if ($pipelineCtx.Review) { try { $pipelineCtx.Review | ConvertTo-Json -Depth 3 -Compress } catch { "Review serialization failed" } } else { "Not available" }
+    $sanityText = if ($pipelineCtx.SanityIssues -and $pipelineCtx.SanityIssues.Count -gt 0) { $pipelineCtx.SanityIssues -join "; " } else { "All checks passed" }
 
     # Build a clean manifest without internal fields
     $cleanManifest = $Manifest.Clone()
@@ -910,7 +923,7 @@ $codeJson
 $reviewJson
 
 ## PIPELINE STEP 4 — SANITY CHECK (Graph API validation):
-$sanityIssues
+$sanityText
 
 ## FINAL MANIFEST (what will be deployed):
 $manifestJson

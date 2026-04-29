@@ -1100,12 +1100,54 @@ function Deploy-ToIntune {
     $es = $ce.Open(); $fs = [System.IO.File]::Create($tmpFile); $es.CopyTo($fs); $fs.Close(); $es.Close(); $zip.Dispose()
     $encSize = (Get-Item $tmpFile).Length
 
+    # Generate content file manifest XML (required by Graph API)
+    $manifestXml = @"
+<Arguments xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <InstallCommandLine>$([System.Security.SecurityElement]::Escape($Manifest.Install.CommandLine))</InstallCommandLine>
+  <UninstallCommandLine>$([System.Security.SecurityElement]::Escape($Manifest.Install.UninstallCommandLine))</UninstallCommandLine>
+  <RunAs32Bit>false</RunAs32Bit>
+  <MinimumFreeDiskSpaceInMB xsi:nil="true" />
+  <MinimumMemoryInMB xsi:nil="true" />
+  <MinimumNumberOfProcessors xsi:nil="true" />
+  <MinimumCpuSpeed xsi:nil="true" />
+  <InstallExperience>
+    <RunAsAccount>0</RunAsAccount>
+    <RequiresLogon>true</RequiresLogon>
+    <InstallProgramVisibility>3</InstallProgramVisibility>
+    <MaximumRetries>3</MaximumRetries>
+    <RetryIntervalInMinutes>5</RetryIntervalInMinutes>
+    <MaxRunTimeInMinutes>60</MaxRunTimeInMinutes>
+    <DeviceRestartBehavior>2</DeviceRestartBehavior>
+  </InstallExperience>
+  <ReturnCodes>
+    <ReturnCode>0</ReturnCode>
+    <Type>1</Type>
+  </ReturnCodes>
+  <ReturnCodes>
+    <ReturnCode>3010</ReturnCode>
+    <Type>2</Type>
+  </ReturnCodes>
+  <ReturnCodes>
+    <ReturnCode>1641</ReturnCode>
+    <Type>3</Type>
+  </ReturnCodes>
+  <ReturnCodes>
+    <ReturnCode>1618</ReturnCode>
+    <Type>4</Type>
+  </ReturnCodes>
+  <SetupFilePath>$([System.Security.SecurityElement]::Escape($Manifest.Install.SetupFile))</SetupFilePath>
+  <UninstallSupported>false</UninstallSupported>
+</Arguments>
+"@
+    $manifestB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($manifestXml))
+
     # Create content file
     $cfBody = @{
         "@odata.type"  = "#microsoft.graph.mobileAppContentFile"
         name           = $Manifest.Install.SetupFile
         size           = [int64]$fileSize
         sizeEncrypted  = [int64]$encSize
+        manifest       = $manifestB64
         isDependency   = $false
     } | ConvertTo-Json
     $cf = Invoke-MgGraphRequest -Method POST `

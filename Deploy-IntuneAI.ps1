@@ -525,9 +525,9 @@ $currentManifest
                             check32BitOn64System = $false
                             keyPath              = $r.keyPath
                             valueName            = $r.valueName
-                            operationType        = if ($r.operator -eq "exists") { "exists" } else { "integerComparison" }
-                            operator             = if ($r.operator -and $r.operator -ne "exists") { $r.operator } else { "notConfigured" }
-                            comparisonValue      = if ($r.comparisonValue) { $r.comparisonValue } else { $null }
+                            operationType        = if ($r.operator -eq "exists") { "exists" } elseif ($r.operator -match "greaterThan|lessThan|equal") { "integer" } else { "exists" }
+                            operator             = switch ($r.operator) { "exists" { "notConfigured" } "equal" { "equal" } "greaterThanOrEqual" { "greaterThanOrEqual" } "greaterThan" { "greaterThan" } "lessThanOrEqual" { "lessThanOrEqual" } "lessThan" { "lessThan" } "notEqual" { "notEqual" } default { "notConfigured" } }
+                            comparisonValue      = if ($r.comparisonValue) { "$($r.comparisonValue)" } else { $null }
                         }
                     }
                     "file" {

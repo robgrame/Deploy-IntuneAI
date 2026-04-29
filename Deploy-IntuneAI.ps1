@@ -476,7 +476,7 @@ Return your plan as a JSON object:
 }
 "@
 
-    $planText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 3000
+    $planText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 6000
     if ($planText -match '```json\s*([\s\S]*?)\s*```') { $planText = $Matches[1] }
     return ($planText | ConvertFrom-Json)
 }
@@ -554,7 +554,7 @@ $($Manifest | ConvertTo-Json -Depth 5)
 }
 "@
 
-    $codeText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 2000
+    $codeText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 4000
     if ($codeText -match '```json\s*([\s\S]*?)\s*```') { $codeText = $Matches[1] }
     return ($codeText | ConvertFrom-Json)
 }
@@ -608,7 +608,7 @@ $($CodeResult | ConvertTo-Json -Depth 5)
 }
 "@
 
-    $reviewText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 2000
+    $reviewText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 4000
     if ($reviewText -match '```json\s*([\s\S]*?)\s*```') { $reviewText = $Matches[1] }
     return ($reviewText | ConvertFrom-Json)
 }
@@ -977,7 +977,7 @@ Be specific and technical. Reference actual file names, registry paths, and comm
 "@
 
     try {
-        $reportText = Invoke-AICall -SystemPrompt "You are a senior technical writer specializing in Microsoft Intune endpoint management. Write comprehensive, precise Markdown reports." -UserPrompt $reportPrompt -MaxTokens 5000
+        $reportText = Invoke-AICall -SystemPrompt "You are a senior technical writer specializing in Microsoft Intune endpoint management. Write comprehensive, precise Markdown reports." -UserPrompt $reportPrompt -MaxTokens 10000
 
         # Strip markdown code fences if the model wrapped it
         $reportText = $reportText -replace '^```markdown\s*', '' -replace '\s*```$', ''

@@ -890,105 +890,89 @@ function Build-AIReport {
 
     $fileList = ($Inventory.AllFiles | ForEach-Object { "$($_.RelPath) ($($_.SizeKB)KB)" }) -join "`n"
     
-    # Get pipeline context for rich reporting
+    # Extract pipeline context as plain text to avoid JSON serialization issues
     $pipelineCtx = $Manifest._PipelineContext
-    $planJson = if ($pipelineCtx.Plan) { try { $pipelineCtx.Plan | ConvertTo-Json -Depth 3 -Compress } catch { "Plan serialization failed" } } else { "Not available" }
-    $codeJson = if ($pipelineCtx.CodeResult) { try { $pipelineCtx.CodeResult | ConvertTo-Json -Depth 3 -Compress } catch { "Code serialization failed" } } else { "Not available" }
-    $reviewJson = if ($pipelineCtx.Review) { try { $pipelineCtx.Review | ConvertTo-Json -Depth 3 -Compress } catch { "Review serialization failed" } } else { "Not available" }
+    
+    $planSummary = "Not available"
+    if ($pipelineCtx.Plan) {
+        $p = $pipelineCtx.Plan
+        $planSummary = "Package type: $($p.packageType)`nExecution flow: $($p.executionFlow)`nInstall strategy: $($p.installStrategy)`nUninstall strategy: $($p.uninstallStrategy)`nRisks: $(if($p.risks){$p.risks -join '; '}else{'None identified'})"
+    }
+
+    $codeSummary = "Not available"
+    if ($pipelineCtx.CodeResult) {
+        $c = $pipelineCtx.CodeResult
+        $codeSummary = "Display name: $($c.displayName)`nPublisher: $($c.publisher)`nInstall: $($c.installCommandLine)`nUninstall: $($c.uninstallCommandLine)`nDetection type: $($c.detectionType)`nTemplate used: $($c.detectionTemplateName)`nConfidence: $($c.confidence)`nJustification: $($c.selectedDetectionJustification)"
+    }
+
+    $reviewSummary = "Not available"
+    if ($pipelineCtx.Review) {
+        $rv = $pipelineCtx.Review
+        $reviewSummary = "Approved: $($rv.approved)`nOverall: $($rv.overallAssessment)"
+        if ($rv.issues) {
+            $issueLines = $rv.issues | ForEach-Object { "- [$($_.severity)] $($_.field): $($_.problem) -> FIX: $($_.suggestion)" }
+            $reviewSummary += "`nIssues:`n$($issueLines -join "`n")"
+        }
+    }
+
     $sanityText = if ($pipelineCtx.SanityIssues -and $pipelineCtx.SanityIssues.Count -gt 0) { $pipelineCtx.SanityIssues -join "; " } else { "All checks passed" }
 
-    # Build a clean manifest without internal fields
-    $cleanManifest = $Manifest.Clone()
-    $cleanManifest.Remove('_PipelineContext')
-    $manifestJson = $cleanManifest | ConvertTo-Json -Depth 5
+    # Build clean manifest summary
+    $manifestSummary = @"
+App name: $($Manifest.Metadata.DisplayName)
+Publisher: $($Manifest.Metadata.Publisher)
+Description: $($Manifest.Metadata.Description)
+Setup file: $($Manifest.Install.SetupFile)
+Install command: $($Manifest.Install.CommandLine)
+Uninstall command: $($Manifest.Install.UninstallCommandLine)
+Detection type: $($Manifest.Detection.Type) ($($Manifest.Detection.Rules.Count) rules)
+Architecture: $($Manifest.Requirements.Architecture)
+Min OS: $($Manifest.Requirements.MinOS)
+Confidence: $($Manifest.Confidence)
+Source: $($Manifest.Source)
+"@
 
     $reportPrompt = @"
-You are a senior technical writer creating a packaging decision report for an Intune Win32 app.
+Create a detailed Markdown packaging decision report for an Intune Win32 app.
 
-This report documents the COMPLETE AI pipeline that was used to analyze and package this application. An IT admin will use this report to understand every decision, verify correctness, and troubleshoot issues.
+SOURCE PATH: $SourcePath
 
-## Source Path:
-$SourcePath
-
-## Files in package:
+FILES IN PACKAGE:
 $fileList
 
-## PIPELINE STEP 1 — PLAN (package analysis):
-$planJson
+STEP 1 - PLAN (package analysis):
+$planSummary
 
-## PIPELINE STEP 2 — CODING (configuration generation):
-$codeJson
+STEP 2 - CODING (configuration generation):
+$codeSummary
 
-## PIPELINE STEP 3 — RUBBER DUCK REVIEW (self-critique):
-$reviewJson
+STEP 3 - RUBBER DUCK REVIEW:
+$reviewSummary
 
-## PIPELINE STEP 4 — SANITY CHECK (Graph API validation):
+STEP 4 - SANITY CHECK:
 $sanityText
 
-## FINAL MANIFEST (what will be deployed):
-$manifestJson
+FINAL MANIFEST:
+$manifestSummary
 
-## Generate a detailed Markdown report with ALL of these sections:
+Write a complete Markdown report with these sections:
+1. Executive Summary
+2. Package Contents Analysis (table of files with roles)
+3. Execution Flow (numbered step-by-step trace)
+4. Install Command (exact command, why this format, exit code handling)
+5. Uninstall Command (or explain why none exists)
+6. Detection Rules Decision Process (candidates considered, selected vs rejected, template used)
+7. Requirements (OS, architecture, custom)
+8. Rubber Duck Review Results (issues found, corrections applied)
+9. Sanity Check Results
+10. Risk Assessment and Testing Recommendations
+11. Troubleshooting Guide
 
-# [App Name] — Intune Win32 App Packaging Report
-
-## 1. Executive Summary
-What this package does, who published it, one paragraph overview.
-
-## 2. Package Contents Analysis
-Table of ALL files with columns: File | Size | Role (entry point / helper / config / tool / diagnostic) | Notes.
-
-## 3. Execution Flow
-Step-by-step trace: what happens when the install command runs. Which file calls which, in what context, with what parameters. Use a numbered list.
-
-## 4. Install Command
-- The exact command chosen
-- WHY this format (cmd.exe /c vs direct, etc.)
-- How exit codes are propagated
-- What the Intune Management Extension will see
-
-## 5. Uninstall Command
-- The exact command
-- Whether a real uninstall exists or it's a placeholder
-- What artifacts remain after "uninstall"
-
-## 6. Detection Rules — Decision Process
-For EACH detection candidate that was considered:
-- What artifact it checks
-- Why it was SELECTED or REJECTED
-- False positive risk
-- False negative risk
-Show the final selected rule with full registry path/value.
-
-## 7. Requirements
-- OS version and why
-- Architecture and why
-- Any other dependencies
-
-## 8. Rubber Duck Review Results
-- Issues found (critical/warning/info)
-- Corrections applied
-- Overall assessment
-
-## 9. Sanity Check Results
-- Graph API validation results
-- Any schema corrections applied
-
-## 10. Risk Assessment & Testing Recommendations
-- Confidence level and what drives it
-- What could go wrong in production
-- Recommended testing steps before broad deployment
-
-## 11. Troubleshooting Guide
-- Common failure scenarios and resolution steps
-- How to verify the detection rule manually
-- Log locations
-
-Write the COMPLETE Markdown document. Be specific — reference actual file names, registry paths, command lines, and pipeline data.
+Be specific and technical. Reference actual file names, registry paths, and command lines.
 "@
 
     try {
-        $reportText = Invoke-AICall -SystemPrompt "You are a senior technical writer specializing in Microsoft Intune and endpoint management. Write comprehensive, precise, actionable Markdown reports. Include every detail from the pipeline data provided." -UserPrompt $reportPrompt -MaxTokens 5000
+        $reportText = Invoke-AICall -SystemPrompt "You are a senior technical writer specializing in Microsoft Intune endpoint management. Write comprehensive, precise Markdown reports." -UserPrompt $reportPrompt -MaxTokens 5000
 
         # Strip markdown code fences if the model wrapped it
         $reportText = $reportText -replace '^```markdown\s*', '' -replace '\s*```$', ''

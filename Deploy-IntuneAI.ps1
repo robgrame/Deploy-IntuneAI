@@ -575,6 +575,7 @@ function Deploy-ToIntune {
         description                     = $Manifest.Metadata.Description
         publisher                       = $Manifest.Metadata.Publisher
         fileName                        = [System.IO.Path]::GetFileName($IntuneWinFile)
+        setupFilePath                   = $Manifest.Install.SetupFile
         installCommandLine              = $Manifest.Install.CommandLine
         uninstallCommandLine            = $Manifest.Install.UninstallCommandLine
         installExperience               = @{ runAsAccount = "system"; deviceRestartBehavior = "suppress" }

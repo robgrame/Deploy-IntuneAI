@@ -483,7 +483,7 @@ Return your plan as a JSON object:
 
 # ---- STEP 2B: CODE (generate manifest from plan) ----
 function Invoke-AICoding {
-    param([hashtable]$Plan, [hashtable]$Manifest)
+    param($Plan, [hashtable]$Manifest)
 
     # Load detection library for the AI to reference
     $libPath = Join-Path (Split-Path $PSCommandPath) "lib\detection-library.json"
@@ -561,7 +561,7 @@ $($Manifest | ConvertTo-Json -Depth 5)
 
 # ---- STEP 2C: RUBBER DUCK (self-critique) ----
 function Invoke-AIRubberDuck {
-    param([hashtable]$Plan, $CodeResult, [hashtable]$Manifest)
+    param($Plan, $CodeResult, [hashtable]$Manifest)
 
     $systemPrompt = @"
 You are a skeptical senior Intune engineer reviewing a colleague's packaging work. Your job is to find problems BEFORE this package is deployed to thousands of devices.

@@ -338,60 +338,68 @@ function Build-LocalManifest {
 
 #endregion
 
-#region ===== PHASE 2: AI ENHANCEMENT =====
+#region ===== PHASE 2: AI PIPELINE (Plan → Code → Rubber Duck → Sanity Check) =====
 
-function Invoke-AIAnalysis {
-    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest)
-
-    if ($NoAI) { return $Manifest }
-
-    # Support both API key and Entra ID auth
-    $authHeaders = @{ "Content-Type" = "application/json" }
+function Get-AIAuthHeaders {
+    $headers = @{ "Content-Type" = "application/json" }
     if ($AzureOpenAIKey) {
-        $authHeaders["api-key"] = $AzureOpenAIKey
+        $headers["api-key"] = $AzureOpenAIKey
     } else {
-        # Try Entra ID token via az CLI
         try {
             $token = (az account get-access-token --resource "https://cognitiveservices.azure.com" --query "accessToken" -o tsv 2>$null)
-            if ($token) { $authHeaders["Authorization"] = "Bearer $token" }
+            if ($token) { $headers["Authorization"] = "Bearer $token" }
         } catch {}
     }
+    return $headers
+}
 
-    if (-not $AzureOpenAIEndpoint) {
-        Write-Warn "Azure OpenAI not configured. Set AZURE_OPENAI_ENDPOINT or use -AzureOpenAIEndpoint."
-        return $Manifest
+function Invoke-AICall {
+    param([string]$SystemPrompt, [string]$UserPrompt, [int]$MaxTokens = 3000)
+
+    $authHeaders = Get-AIAuthHeaders
+    $aiBody = @{
+        messages = @(
+            @{ role = "system"; content = $SystemPrompt }
+            @{ role = "user"; content = $UserPrompt }
+        )
+        temperature = 0.1
     }
-    if (-not $authHeaders.ContainsKey("api-key") -and -not $authHeaders.ContainsKey("Authorization")) {
-        Write-Warn "No Azure OpenAI credentials. Set AZURE_OPENAI_KEY or login with 'az login'."
-        return $Manifest
+    if ($AzureOpenAIDeployment -match "gpt-5|o4|codex") {
+        $aiBody["max_completion_tokens"] = $MaxTokens
+    } else {
+        $aiBody["max_tokens"] = $MaxTokens
     }
+    $aiBody = $aiBody | ConvertTo-Json -Depth 5
 
-    Write-Detail "Preparing AI analysis request..."
+    $apiVersion = if ($AzureOpenAIDeployment -match "gpt-5|o4|codex") { "2025-04-01-preview" } else { "2024-02-15-preview" }
+    $uri = "$AzureOpenAIEndpoint/openai/deployments/$AzureOpenAIDeployment/chat/completions?api-version=$apiVersion"
 
-    # Build safe context (no secrets, summarized)
+    $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $authHeaders -Body $aiBody -TimeoutSec 120
+    return $response.choices[0].message.content
+}
+
+function Get-PackageContext {
+    param([string]$SourcePath, [hashtable]$Inventory)
+
     $fileList = ($Inventory.AllFiles | ForEach-Object { "$($_.RelPath) ($($_.SizeKB)KB)" }) -join "`n"
-    
-    # Collect ALL scripts (not just first 3), prioritizing entry points
+
+    # Collect scripts with priority ordering and budget
     $scriptSummaries = @()
     $orderedScripts = @()
     $orderedScripts += $Inventory.Scripts | Where-Object { $_.Name -match "(?i)(runconfig|install|setup|deploy)" }
     $orderedScripts += $Inventory.Scripts | Where-Object { $_.Name -match "(?i)(config|main|start)" -and $_ -notin $orderedScripts }
     $orderedScripts += $Inventory.Scripts | Where-Object { $_ -notin $orderedScripts }
-    
+
     $totalChars = 0
-    $maxTotalChars = 15000  # Budget for all scripts combined
+    $maxTotalChars = 15000
     foreach ($s in $orderedScripts) {
         $path = Join-Path $SourcePath $s.RelPath
         $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
         if (-not $content) { continue }
-        
-        # Redact potential secrets
         $safe = $content -replace '(?i)(password|secret|key|token|apikey)\s*[:=]\s*[^\s]+', '$1=<REDACTED>'
         $safe = $safe -replace '[A-Za-z0-9+/]{40,}={0,2}', '<BASE64_REDACTED>'
-        
         $remaining = $maxTotalChars - $totalChars
         if ($remaining -le 500) { break }
-        
         if ($safe.Length -gt $remaining) {
             $safe = $safe.Substring(0, $remaining) + "`n... [TRUNCATED at $remaining chars, total $($content.Length) chars]"
         }
@@ -399,124 +407,305 @@ function Invoke-AIAnalysis {
         $totalChars += $safe.Length
     }
 
-    $currentManifest = $Manifest | ConvertTo-Json -Depth 5
+    return @{
+        FileList = $fileList
+        ScriptContent = ($scriptSummaries -join "`n`n")
+    }
+}
+
+# ---- STEP 2A: PLAN ----
+function Invoke-AIPlan {
+    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest)
+
+    $ctx = Get-PackageContext -SourcePath $SourcePath -Inventory $Inventory
 
     $systemPrompt = @"
-You are a senior Microsoft Intune packaging engineer. Your job is to analyze application packages and produce precise Win32 app configurations for deployment via Microsoft Intune.
+You are a senior Intune packaging engineer. Your task is to PLAN how to package this application.
+Do NOT produce the final configuration yet. Instead, analyze the package and create a structured plan.
+Think step by step. Be thorough.
+"@
 
-## Your expertise includes:
-- Identifying the correct setup file (entry point) in multi-file packages
-- Determining silent install/uninstall command lines for MSI, EXE, BAT, PS1 installers
-- Designing reliable detection rules that confirm the app IS installed (not just that files exist)
-- Understanding how scripts modify Windows: registry writes, file copies, service installations, scheduled tasks
+    $userPrompt = @"
+Analyze this package and create a packaging PLAN. Do NOT produce final commands yet.
+
+## Files in package:
+$($ctx.FileList)
+
+## Script/file contents:
+$($ctx.ScriptContent)
+
+## Current heuristic analysis:
+$($Manifest | ConvertTo-Json -Depth 5)
+
+## Create a plan covering:
+
+1. **Package Type Classification**: What kind of package is this? (MSI installer, EXE installer, configuration script, remediation script, driver package, other)
+
+2. **Execution Flow Analysis**: Trace the complete execution flow. Which file is the entry point? What does it call? In what context does it run? What dependencies does it need?
+
+3. **Registry/File Artifacts**: List ALL registry keys and file paths that this package creates, modifies, or checks. For each, note whether it's an INPUT (prerequisite) or OUTPUT (result of installation).
+
+4. **Install Command Strategy**: What is the correct way to silently invoke this package? Consider: execution context (user vs system), 64-bit vs 32-bit, dependencies on other files in the package.
+
+5. **Uninstall Strategy**: Does the package include an uninstall routine? If not, can the changes be reversed? What would an uninstall look like?
+
+6. **Detection Strategy**: Which OUTPUT artifact (from step 3) is the BEST proof that this package ran successfully? Rank candidates by reliability. Explain why each candidate is good or bad.
+
+7. **Risk Factors**: What could go wrong? Are there hard-coded paths? Does it require network access? Reboot? Admin rights beyond SYSTEM?
+
+Return your plan as a JSON object:
+{
+  "packageType": "string",
+  "executionFlow": "step-by-step description",
+  "artifacts": {
+    "inputs": [{"type": "registry|file", "path": "...", "description": "..."}],
+    "outputs": [{"type": "registry|file", "path": "...", "valueName": "...", "expectedValue": "...", "description": "...", "detectionReliability": "high|medium|low"}]
+  },
+  "installStrategy": "description of approach",
+  "uninstallStrategy": "description or 'none'",
+  "detectionCandidates": [
+    {"artifact": "registry or file path", "valueName": "if registry", "why": "justification", "reliability": "high|medium|low", "falsePositiveRisk": "description", "falseNegativeRisk": "description"}
+  ],
+  "risks": ["risk1", "risk2"],
+  "openQuestions": ["question1", "question2"]
+}
+"@
+
+    $planText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 3000
+    if ($planText -match '```json\s*([\s\S]*?)\s*```') { $planText = $Matches[1] }
+    return ($planText | ConvertFrom-Json)
+}
+
+# ---- STEP 2B: CODE (generate manifest from plan) ----
+function Invoke-AICoding {
+    param([hashtable]$Plan, [hashtable]$Manifest)
+
+    $systemPrompt = @"
+You are a senior Intune packaging engineer. Based on the analysis plan provided, produce the FINAL packaging configuration.
 
 ## Critical rules for detection:
 - Detection rules must verify the OUTCOME of the installation, not prerequisites
-- For scripts that write registry keys, identify the MOST SPECIFIC key/value the script creates or modifies
-- Prefer registry detection over file detection when the script writes to the registry
-- If the script sets a registry value to a specific number (e.g., 1), use integerComparison with operator "equal"
-- If the script just creates a key, use "exists"
-- NEVER use generic OS registry keys (like HKLM\Hardware) as detection — these always exist
-- The keyPath must use full format: HKEY_LOCAL_MACHINE\... (not HKLM:\...)
+- Prefer the detection candidate with the highest reliability from the plan
+- NEVER use generic OS registry keys (like HKLM\Hardware) — these always exist
+- keyPath must use full format: HKEY_LOCAL_MACHINE\... (not HKLM:\...)
+- For integer comparison: operationType is "integer", NOT "integerComparison"
+- Valid operationType values: exists, doesNotExist, string, integer, version
+- Valid operator values: notConfigured, equal, notEqual, greaterThan, greaterThanOrEqual, lessThan, lessThanOrEqual
 
 ## Critical rules for install commands:
-- For .bat/.cmd files: use "cmd.exe /c <filename>" to ensure proper execution and exit code propagation
-- For .ps1 files: use "powershell.exe -ExecutionPolicy Bypass -File <filename>"
-- For .msi files: use "msiexec /i <filename> /qn /norestart"
-- For .exe files: determine the installer framework (NSIS, InnoSetup, InstallShield, WiX) and use appropriate silent switches
-- If a .bat launcher calls a .ps1 script, the .bat is the entry point (not the .ps1)
+- .bat/.cmd → cmd.exe /c <filename>
+- .ps1 → powershell.exe -ExecutionPolicy Bypass -File <filename>
+- .msi → msiexec /i <filename> /qn /norestart
+- If a .bat launcher calls a .ps1 script, the .bat is the entry point
 
 ## Critical rules for uninstall:
-- If the package has no uninstall capability, use: cmd.exe /c echo No uninstall available
-- For MSI: msiexec /x {ProductCode} /qn /norestart
-- Never invent an uninstall command that doesn't exist in the package
+- If no uninstall exists: cmd.exe /c echo No uninstall available
+- Never invent an uninstall that doesn't exist
 "@
 
-    $prompt = @"
-Analyze this application package for Intune Win32 app deployment.
+    $userPrompt = @"
+Based on this analysis plan, produce the final Intune Win32 app configuration.
 
-## File inventory:
-$fileList
+## Analysis Plan:
+$($Plan | ConvertTo-Json -Depth 5)
 
-## Script/file contents:
-$($scriptSummaries -join "`n`n")
+## Current heuristic manifest (starting point):
+$($Manifest | ConvertTo-Json -Depth 5)
 
-## Current heuristic analysis (may be inaccurate):
-$currentManifest
-
-## Instructions:
-1. READ the script contents carefully. Identify what the scripts DO (not just what files exist).
-2. Trace the execution flow: which file is the entry point? What does it call? What registry keys does it write?
-3. Identify the BEST detection rule — a registry key/value that ONLY exists AFTER this script runs successfully.
-4. Determine the correct install command line based on the entry point file type.
-5. Check if an uninstall routine exists in the package.
-
-## Return ONLY a valid JSON object:
+## Return ONLY a JSON object:
 {
-  "displayName": "Human-friendly app name based on script purpose",
-  "publisher": "Publisher/vendor (read from script headers or metadata)",
-  "description": "What this package does when installed (1-2 sentences)",
+  "displayName": "Human-friendly app name",
+  "publisher": "Publisher name",
+  "description": "What this package does (1-2 sentences)",
   "installCommandLine": "Exact silent install command",
-  "uninstallCommandLine": "Exact silent uninstall command or placeholder",
+  "uninstallCommandLine": "Exact uninstall command or placeholder",
   "detectionType": "registry|file|productCode",
   "detectionRules": [
     {
       "type": "registry",
-      "keyPath": "HKEY_LOCAL_MACHINE\\full\\path\\to\\key",
+      "keyPath": "HKEY_LOCAL_MACHINE\\full\\path",
       "valueName": "ValueName",
       "operator": "exists|equal|greaterThanOrEqual",
-      "comparisonValue": "value if using equal/comparison, omit for exists"
+      "comparisonValue": "if applicable"
     }
   ],
-  "minOS": "1803|1903|2004|21H1|21H2|22H2",
+  "minOS": "1803|1903|21H2|22H2",
   "architecture": "x64|x86|all",
   "confidence": "high|medium|low",
-  "reasoning": "Step-by-step explanation: 1) entry point identification 2) execution flow 3) detection rule justification"
+  "selectedDetectionJustification": "Why this detection rule was chosen over alternatives"
 }
 "@
 
+    $codeText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 2000
+    if ($codeText -match '```json\s*([\s\S]*?)\s*```') { $codeText = $Matches[1] }
+    return ($codeText | ConvertFrom-Json)
+}
+
+# ---- STEP 2C: RUBBER DUCK (self-critique) ----
+function Invoke-AIRubberDuck {
+    param([hashtable]$Plan, $CodeResult, [hashtable]$Manifest)
+
+    $systemPrompt = @"
+You are a skeptical senior Intune engineer reviewing a colleague's packaging work. Your job is to find problems BEFORE this package is deployed to thousands of devices.
+
+Be critical. Challenge every assumption. Look for:
+- Detection rules that could cause false positives (app appears installed when it's not)
+- Detection rules that could cause false negatives (app IS installed but not detected → re-installs on every sync)
+- Install commands that could fail silently
+- Missing dependencies or prerequisites
+- Security concerns
+"@
+
+    $userPrompt = @"
+Review this Intune Win32 app packaging decision.
+
+## Analysis Plan:
+$($Plan | ConvertTo-Json -Depth 5)
+
+## Proposed Configuration:
+$($CodeResult | ConvertTo-Json -Depth 5)
+
+## Review checklist:
+1. Is the detection rule actually created by THIS script/installer? Or does it already exist on most machines?
+2. Will the install command work when run as SYSTEM by the Intune Management Extension? (no user context, no GUI, no network drives)
+3. Is the uninstall command appropriate?
+4. Are the OS requirements correct?
+5. Could this package conflict with existing GPO/MDM policies?
+
+## Return a JSON object:
+{
+  "approved": true|false,
+  "issues": [
+    {
+      "severity": "critical|warning|info",
+      "field": "which field has the issue (detection, install, uninstall, requirements)",
+      "problem": "what's wrong",
+      "suggestion": "how to fix it"
+    }
+  ],
+  "correctedConfig": {
+    "only include fields that need to be changed, or null if approved"
+  },
+  "overallAssessment": "Summary of the review"
+}
+"@
+
+    $reviewText = Invoke-AICall -SystemPrompt $systemPrompt -UserPrompt $userPrompt -MaxTokens 2000
+    if ($reviewText -match '```json\s*([\s\S]*?)\s*```') { $reviewText = $Matches[1] }
+    return ($reviewText | ConvertFrom-Json)
+}
+
+# ---- STEP 2D: SANITY CHECK (validate Graph API compatibility) ----
+function Invoke-SanityCheck {
+    param([hashtable]$Manifest)
+
+    $issues = @()
+
+    # Validate detection rules
+    foreach ($rule in $Manifest.Detection.Rules) {
+        if ($rule.'@odata.type' -eq '#microsoft.graph.win32LobAppRegistryRule') {
+            $validOps = @('notConfigured','exists','doesNotExist','string','integer','version')
+            if ($rule.operationType -and $rule.operationType -notin $validOps) {
+                $issues += "Invalid operationType '$($rule.operationType)'. Valid: $($validOps -join ', ')"
+            }
+            $validOperators = @('notConfigured','equal','notEqual','greaterThan','greaterThanOrEqual','lessThan','lessThanOrEqual')
+            if ($rule.operator -and $rule.operator -notin $validOperators) {
+                $issues += "Invalid operator '$($rule.operator)'. Valid: $($validOperators -join ', ')"
+            }
+            if ($rule.keyPath -match '^HKLM\\') {
+                $issues += "keyPath uses short format '$($rule.keyPath)'. Must use HKEY_LOCAL_MACHINE\\"
+                # Auto-fix
+                $rule.keyPath = $rule.keyPath -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\'
+            }
+            if (-not $rule.keyPath -or -not $rule.valueName) {
+                $issues += "Detection rule missing keyPath or valueName"
+            }
+        }
+    }
+
+    # Validate install command
+    if (-not $Manifest.Install.CommandLine) { $issues += "Install command line is empty" }
+    if (-not $Manifest.Install.SetupFile) { $issues += "Setup file is not specified" }
+
+    # Validate metadata
+    if (-not $Manifest.Metadata.DisplayName -or $Manifest.Metadata.DisplayName.Length -lt 3) { $issues += "Display name too short or empty" }
+    if (-not $Manifest.Metadata.Publisher) { $issues += "Publisher is empty" }
+
+    return $issues
+}
+
+# ---- ORCHESTRATOR: Run the full AI pipeline ----
+function Invoke-AIAnalysis {
+    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest)
+
+    if ($NoAI) { return $Manifest }
+
+    $authHeaders = Get-AIAuthHeaders
+    if (-not $AzureOpenAIEndpoint) {
+        Write-Warn "Azure OpenAI not configured. Set AZURE_OPENAI_ENDPOINT."
+        return $Manifest
+    }
+    if (-not $authHeaders.ContainsKey("api-key") -and -not $authHeaders.ContainsKey("Authorization")) {
+        Write-Warn "No Azure OpenAI credentials. Set AZURE_OPENAI_KEY or login with 'az login'."
+        return $Manifest
+    }
+
     try {
-        $aiBody = @{
-            messages = @(
-                @{ role = "system"; content = $systemPrompt }
-                @{ role = "user"; content = $prompt }
-            )
-            temperature = 0.1
+        # ===== STEP A: PLAN =====
+        Write-Detail "Step 1/4: Planning — analyzing package structure and execution flow..."
+        $plan = Invoke-AIPlan -SourcePath $SourcePath -Inventory $Inventory -Manifest $Manifest
+        Write-OK "Plan complete: $($plan.packageType) — $($plan.detectionCandidates.Count) detection candidates identified"
+
+        # ===== STEP B: CODE =====
+        Write-Detail "Step 2/4: Coding — generating Intune configuration from plan..."
+        $codeResult = Invoke-AICoding -Plan $plan -Manifest $Manifest
+        Write-OK "Configuration generated (confidence: $($codeResult.confidence))"
+
+        # ===== STEP C: RUBBER DUCK =====
+        Write-Detail "Step 3/4: Rubber Duck — reviewing configuration for issues..."
+        $review = Invoke-AIRubberDuck -Plan $plan -CodeResult $codeResult -Manifest $Manifest
+
+        $criticalIssues = @($review.issues | Where-Object { $_.severity -eq "critical" })
+        $warnings = @($review.issues | Where-Object { $_.severity -eq "warning" })
+        
+        if ($criticalIssues.Count -gt 0) {
+            Write-Warn "Rubber Duck found $($criticalIssues.Count) critical issue(s):"
+            foreach ($issue in $criticalIssues) {
+                Write-Detail "  CRITICAL [$($issue.field)]: $($issue.problem)" 
+                Write-Detail "  FIX: $($issue.suggestion)"
+            }
+            # Apply corrections if provided
+            if ($review.correctedConfig) {
+                Write-Detail "Applying Rubber Duck corrections..."
+                $corrected = $review.correctedConfig
+                if ($corrected.installCommandLine) { $codeResult.installCommandLine = $corrected.installCommandLine }
+                if ($corrected.uninstallCommandLine) { $codeResult.uninstallCommandLine = $corrected.uninstallCommandLine }
+                if ($corrected.detectionRules) { $codeResult.detectionRules = $corrected.detectionRules }
+            }
         }
-        # GPT-5.x models use max_completion_tokens, older models use max_tokens
-        if ($AzureOpenAIDeployment -match "gpt-5|o4|codex") {
-            $aiBody["max_completion_tokens"] = 2000
+        if ($warnings.Count -gt 0) {
+            Write-Warn "Rubber Duck raised $($warnings.Count) warning(s):"
+            foreach ($w in $warnings) { Write-Detail "  WARNING [$($w.field)]: $($w.problem)" }
+        }
+        if ($review.approved) {
+            Write-OK "Rubber Duck approved: $($review.overallAssessment)"
         } else {
-            $aiBody["max_tokens"] = 2000
+            Write-Warn "Rubber Duck flagged issues but proceeding with corrections applied"
         }
-        $aiBody = $aiBody | ConvertTo-Json -Depth 5
 
-        $apiVersion = if ($AzureOpenAIDeployment -match "gpt-5|o4|codex") { "2025-04-01-preview" } else { "2024-02-15-preview" }
-        $uri = "$AzureOpenAIEndpoint/openai/deployments/$AzureOpenAIDeployment/chat/completions?api-version=$apiVersion"
-        
-        $response = Invoke-RestMethod -Uri $uri -Method POST -Headers $authHeaders -Body $aiBody -TimeoutSec 60
-        $aiText = $response.choices[0].message.content
-        
-        # Extract JSON from response
-        if ($aiText -match '```json\s*([\s\S]*?)\s*```') { $aiText = $Matches[1] }
-        $aiResult = $aiText | ConvertFrom-Json
-
-        Write-OK "AI analysis complete (confidence: $($aiResult.confidence))"
-        Write-Detail "AI reasoning: $($aiResult.reasoning)"
-
-        # Merge AI results into manifest (AI fills gaps, doesn't override high-confidence local data)
+        # ===== MERGE INTO MANIFEST =====
         if ($Manifest.Confidence -ne "high") {
-            if ($aiResult.displayName) { $Manifest.Metadata.DisplayName = $aiResult.displayName }
-            if ($aiResult.publisher) { $Manifest.Metadata.Publisher = $aiResult.publisher }
-            if ($aiResult.installCommandLine) { $Manifest.Install.CommandLine = $aiResult.installCommandLine }
-            if ($aiResult.uninstallCommandLine) { $Manifest.Install.UninstallCommandLine = $aiResult.uninstallCommandLine }
+            if ($codeResult.displayName) { $Manifest.Metadata.DisplayName = $codeResult.displayName }
+            if ($codeResult.publisher) { $Manifest.Metadata.Publisher = $codeResult.publisher }
+            if ($codeResult.installCommandLine) { $Manifest.Install.CommandLine = $codeResult.installCommandLine }
+            if ($codeResult.uninstallCommandLine) { $Manifest.Install.UninstallCommandLine = $codeResult.uninstallCommandLine }
         }
-        if ($aiResult.description) { $Manifest.Metadata.Description = $aiResult.description }
+        if ($codeResult.description) { $Manifest.Metadata.Description = $codeResult.description }
 
-        # AI detection rules only if local detection is low confidence
-        if ($Manifest.Confidence -eq "low" -and $aiResult.detectionRules) {
+        # Map AI detection rules to Graph API format
+        if ($Manifest.Confidence -eq "low" -and $codeResult.detectionRules) {
             $graphRules = @()
-            foreach ($r in $aiResult.detectionRules) {
+            foreach ($r in $codeResult.detectionRules) {
                 switch ($r.type) {
                     "registry" {
                         $graphRules += @{
@@ -552,18 +741,269 @@ $currentManifest
                 }
             }
             if ($graphRules.Count -gt 0) {
-                $Manifest.Detection = @{ Type = $aiResult.detectionType; Rules = $graphRules }
+                $Manifest.Detection = @{ Type = $codeResult.detectionType; Rules = $graphRules }
             }
         }
 
-        $Manifest.Confidence = $aiResult.confidence
+        $Manifest.Confidence = $codeResult.confidence
         $Manifest.Source = "ai-enhanced"
+
+        # ===== STEP D: SANITY CHECK =====
+        Write-Detail "Step 4/4: Sanity Check — validating Graph API compatibility..."
+        $sanityIssues = Invoke-SanityCheck -Manifest $Manifest
+        if ($sanityIssues.Count -gt 0) {
+            Write-Warn "Sanity check found $($sanityIssues.Count) issue(s):"
+            foreach ($si in $sanityIssues) { Write-Detail "  - $si" }
+        } else {
+            Write-OK "Sanity check passed — manifest is Graph API compatible"
+        }
+
+        # Store pipeline context for report generation
+        $Manifest._PipelineContext = @{
+            Plan = $plan
+            CodeResult = $codeResult
+            Review = $review
+            SanityIssues = $sanityIssues
+        }
+
         return $Manifest
 
     } catch {
-        Write-Warn "AI analysis failed: $($_.Exception.Message)"
+        Write-Warn "AI pipeline failed: $($_.Exception.Message)"
         Write-Detail "Continuing with heuristic results only"
         return $Manifest
+    }
+}
+
+# ---- REPORT GENERATION ----
+function New-PackagingReport {
+    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest, [string]$OutputPath)
+
+    if ($NoAI -or -not $AzureOpenAIEndpoint -or -not $Manifest._PipelineContext) {
+        $report = Build-HeuristicReport -SourcePath $SourcePath -Inventory $Inventory -Manifest $Manifest
+    } else {
+        $report = Build-AIReport -SourcePath $SourcePath -Inventory $Inventory -Manifest $Manifest
+    }
+
+    $reportPath = Join-Path $OutputPath "PackagingReport.md"
+    $report | Set-Content -Path $reportPath -Encoding UTF8
+    Write-OK "Packaging report saved: $reportPath"
+    return $reportPath
+}
+
+function Build-HeuristicReport {
+    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest)
+
+    $detectionDetail = ($Manifest.Detection.Rules | ForEach-Object {
+        if ($_.keyPath) { "- Registry: ``$($_.keyPath)\$($_.valueName)`` (operationType: $($_.operationType))" }
+        elseif ($_.path) { "- File: ``$($_.path)\$($_.fileOrFolderName)`` (exists)" }
+        elseif ($_.productCode) { "- MSI ProductCode: ``$($_.productCode)`` (version >= $($_.productVersion))" }
+    }) -join "`n"
+
+    return @"
+# Intune Win32 App — Packaging Report
+
+**Generated:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+**Source:** $SourcePath
+**Analysis mode:** Heuristic only (no AI)
+
+---
+
+## 1. Package Contents
+
+| Metric | Value |
+|--------|-------|
+| Total files | $($Inventory.AllFiles.Count) |
+| MSI installers | $($Inventory.MSIs.Count) |
+| EXE files | $($Inventory.EXEs.Count) |
+| Scripts (ps1/bat/cmd/vbs) | $($Inventory.Scripts.Count) |
+| Config files | $($Inventory.Configs.Count) |
+| Total size | $($Inventory.TotalSizeMB) MB |
+
+### File listing
+``````
+$( ($Inventory.AllFiles | ForEach-Object { "$($_.RelPath) ($($_.SizeKB) KB)" }) -join "`n" )
+``````
+
+## 2. Entry Point Selection
+
+**Selected setup file:** ``$($Manifest.Install.SetupFile)``
+
+**How it was chosen:** Heuristic file ranking based on filename patterns. Priority order:
+1. Batch/CMD files matching ``run*``, ``install*``, ``setup*``
+2. PowerShell scripts matching ``install*``, ``setup*``, ``deploy*``, ``config*``
+3. Largest EXE (if no matching scripts found)
+
+## 3. Install Command
+
+**Command:** ``$($Manifest.Install.CommandLine)``
+
+**Rationale:** Determined by file extension of the entry point:
+- ``.bat/.cmd`` → direct execution
+- ``.ps1`` → ``powershell.exe -ExecutionPolicy Bypass -File``
+- ``.msi`` → ``msiexec /i /qn /norestart``
+- ``.exe`` → common silent switches (``/S /SILENT /VERYSILENT``)
+
+## 4. Uninstall Command
+
+**Command:** ``$($Manifest.Install.UninstallCommandLine)``
+
+**Rationale:** No uninstall routine was detected in the package. Placeholder command used.
+
+## 5. Detection Rules
+
+**Type:** $($Manifest.Detection.Type)
+**Confidence:** $($Manifest.Confidence)
+
+$detectionDetail
+
+**How detection was determined:** The script content was parsed for registry writes (``Set-ItemProperty``, ``New-ItemProperty``, ``reg add``) and file copy operations. The first relevant registry key found was selected as the detection rule.
+
+## 6. Requirements
+
+| Requirement | Value |
+|------------|-------|
+| Architecture | $($Manifest.Requirements.Architecture) |
+| Minimum OS | $($Manifest.Requirements.MinOS) |
+
+---
+
+*Report generated by Deploy-IntuneAI (heuristic mode)*
+"@
+}
+
+function Build-AIReport {
+    param([string]$SourcePath, [hashtable]$Inventory, [hashtable]$Manifest)
+
+    $fileList = ($Inventory.AllFiles | ForEach-Object { "$($_.RelPath) ($($_.SizeKB)KB)" }) -join "`n"
+    
+    # Get pipeline context for rich reporting
+    $pipelineCtx = $Manifest._PipelineContext
+    $planJson = if ($pipelineCtx.Plan) { $pipelineCtx.Plan | ConvertTo-Json -Depth 5 } else { "Not available" }
+    $codeJson = if ($pipelineCtx.CodeResult) { $pipelineCtx.CodeResult | ConvertTo-Json -Depth 5 } else { "Not available" }
+    $reviewJson = if ($pipelineCtx.Review) { $pipelineCtx.Review | ConvertTo-Json -Depth 5 } else { "Not available" }
+    $sanityIssues = if ($pipelineCtx.SanityIssues) { $pipelineCtx.SanityIssues -join "`n- " } else { "None" }
+
+    # Build a clean manifest without internal fields
+    $cleanManifest = $Manifest.Clone()
+    $cleanManifest.Remove('_PipelineContext')
+    $manifestJson = $cleanManifest | ConvertTo-Json -Depth 5
+
+    $reportPrompt = @"
+You are a senior technical writer creating a packaging decision report for an Intune Win32 app.
+
+This report documents the COMPLETE AI pipeline that was used to analyze and package this application. An IT admin will use this report to understand every decision, verify correctness, and troubleshoot issues.
+
+## Source Path:
+$SourcePath
+
+## Files in package:
+$fileList
+
+## PIPELINE STEP 1 — PLAN (package analysis):
+$planJson
+
+## PIPELINE STEP 2 — CODING (configuration generation):
+$codeJson
+
+## PIPELINE STEP 3 — RUBBER DUCK REVIEW (self-critique):
+$reviewJson
+
+## PIPELINE STEP 4 — SANITY CHECK (Graph API validation):
+$sanityIssues
+
+## FINAL MANIFEST (what will be deployed):
+$manifestJson
+
+## Generate a detailed Markdown report with ALL of these sections:
+
+# [App Name] — Intune Win32 App Packaging Report
+
+## 1. Executive Summary
+What this package does, who published it, one paragraph overview.
+
+## 2. Package Contents Analysis
+Table of ALL files with columns: File | Size | Role (entry point / helper / config / tool / diagnostic) | Notes.
+
+## 3. Execution Flow
+Step-by-step trace: what happens when the install command runs. Which file calls which, in what context, with what parameters. Use a numbered list.
+
+## 4. Install Command
+- The exact command chosen
+- WHY this format (cmd.exe /c vs direct, etc.)
+- How exit codes are propagated
+- What the Intune Management Extension will see
+
+## 5. Uninstall Command
+- The exact command
+- Whether a real uninstall exists or it's a placeholder
+- What artifacts remain after "uninstall"
+
+## 6. Detection Rules — Decision Process
+For EACH detection candidate that was considered:
+- What artifact it checks
+- Why it was SELECTED or REJECTED
+- False positive risk
+- False negative risk
+Show the final selected rule with full registry path/value.
+
+## 7. Requirements
+- OS version and why
+- Architecture and why
+- Any other dependencies
+
+## 8. Rubber Duck Review Results
+- Issues found (critical/warning/info)
+- Corrections applied
+- Overall assessment
+
+## 9. Sanity Check Results
+- Graph API validation results
+- Any schema corrections applied
+
+## 10. Risk Assessment & Testing Recommendations
+- Confidence level and what drives it
+- What could go wrong in production
+- Recommended testing steps before broad deployment
+
+## 11. Troubleshooting Guide
+- Common failure scenarios and resolution steps
+- How to verify the detection rule manually
+- Log locations
+
+Write the COMPLETE Markdown document. Be specific — reference actual file names, registry paths, command lines, and pipeline data.
+"@
+
+    try {
+        $reportText = Invoke-AICall -SystemPrompt "You are a senior technical writer specializing in Microsoft Intune and endpoint management. Write comprehensive, precise, actionable Markdown reports. Include every detail from the pipeline data provided." -UserPrompt $reportPrompt -MaxTokens 5000
+
+        # Strip markdown code fences if the model wrapped it
+        $reportText = $reportText -replace '^```markdown\s*', '' -replace '\s*```$', ''
+
+        # Append metadata footer
+        $reportText += @"
+
+
+---
+
+## Metadata
+
+| Field | Value |
+|-------|-------|
+| Generated | $(Get-Date -Format "yyyy-MM-dd HH:mm:ss") |
+| AI Model | $AzureOpenAIDeployment |
+| AI Endpoint | $AzureOpenAIEndpoint |
+| Analysis Source | $($Manifest.Source) |
+| Confidence | $($Manifest.Confidence) |
+| Tool | Deploy-IntuneAI |
+
+*This report was auto-generated by [Deploy-IntuneAI](https://github.com/robgrame/Deploy-IntuneAI)*
+"@
+        return $reportText
+
+    } catch {
+        Write-Warn "AI report generation failed: $($_.Exception.Message). Falling back to heuristic report."
+        return (Build-HeuristicReport -SourcePath $SourcePath -Inventory $Inventory -Manifest $Manifest)
     }
 }
 
@@ -759,8 +1199,8 @@ Write-Detail "Files: $($inventory.AllFiles.Count) | MSI: $($inventory.MSIs.Count
 
 $manifest = Build-LocalManifest -SourcePath $SourcePath -Inventory $inventory
 
-# Phase 2: AI Enhancement
-Write-Step "2/5" "AI analysis..." 
+# Phase 2: AI Pipeline (Plan → Code → Rubber Duck → Sanity Check)
+Write-Step "2/5" "AI pipeline..."
 $manifest = Invoke-AIAnalysis -SourcePath $SourcePath -Inventory $inventory -Manifest $manifest
 
 # Show results and ask for confirmation
@@ -783,6 +1223,10 @@ New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 $manifestPath = Join-Path $OutputPath "manifest.json"
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -Path $manifestPath -Encoding UTF8
 Write-Detail "Manifest saved: $manifestPath"
+
+# Generate packaging decision report
+Write-Step "REPORT" "Generating packaging decision report..."
+$reportPath = New-PackagingReport -SourcePath $SourcePath -Inventory $inventory -Manifest $manifest -OutputPath $OutputPath
 
 if ($Mode -eq "Analyze") {
     Write-Host "`nAnalysis complete. Review manifest.json and re-run with -Mode Package/Deploy/Assign." -ForegroundColor Green
@@ -820,6 +1264,7 @@ Write-Host "  App:        $($manifest.Metadata.DisplayName)" -ForegroundColor Wh
 Write-Host "  App ID:     $appId" -ForegroundColor White
 Write-Host "  Assigned:   $AssignTo (Required)" -ForegroundColor White
 Write-Host "  Manifest:   $manifestPath" -ForegroundColor White
+Write-Host "  Report:     $reportPath" -ForegroundColor White
 Write-Host "=============================================" -ForegroundColor Green
 
 #endregion

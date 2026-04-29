@@ -371,67 +371,114 @@ function Invoke-AIAnalysis {
     # Build safe context (no secrets, summarized)
     $fileList = ($Inventory.AllFiles | ForEach-Object { "$($_.RelPath) ($($_.SizeKB)KB)" }) -join "`n"
     
+    # Collect ALL scripts (not just first 3), prioritizing entry points
     $scriptSummaries = @()
-    foreach ($s in $Inventory.Scripts | Select-Object -First 3) {
+    $orderedScripts = @()
+    $orderedScripts += $Inventory.Scripts | Where-Object { $_.Name -match "(?i)(runconfig|install|setup|deploy)" }
+    $orderedScripts += $Inventory.Scripts | Where-Object { $_.Name -match "(?i)(config|main|start)" -and $_ -notin $orderedScripts }
+    $orderedScripts += $Inventory.Scripts | Where-Object { $_ -notin $orderedScripts }
+    
+    $totalChars = 0
+    $maxTotalChars = 15000  # Budget for all scripts combined
+    foreach ($s in $orderedScripts) {
         $path = Join-Path $SourcePath $s.RelPath
         $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
-        if ($content -and $content.Length -le 5000) {
-            # Redact potential secrets
-            $safe = $content -replace '(?i)(password|secret|key|token|apikey)\s*[:=]\s*[^\s]+', '$1=<REDACTED>'
-            $safe = $safe -replace '[A-Za-z0-9+/]{40,}={0,2}', '<BASE64_REDACTED>'
-            $scriptSummaries += "--- $($s.RelPath) ---`n$safe"
-        } elseif ($content) {
-            $scriptSummaries += "--- $($s.RelPath) (truncated, $('{0:N0}' -f $content.Length) chars) ---`n$($content.Substring(0, 3000))..."
+        if (-not $content) { continue }
+        
+        # Redact potential secrets
+        $safe = $content -replace '(?i)(password|secret|key|token|apikey)\s*[:=]\s*[^\s]+', '$1=<REDACTED>'
+        $safe = $safe -replace '[A-Za-z0-9+/]{40,}={0,2}', '<BASE64_REDACTED>'
+        
+        $remaining = $maxTotalChars - $totalChars
+        if ($remaining -le 500) { break }
+        
+        if ($safe.Length -gt $remaining) {
+            $safe = $safe.Substring(0, $remaining) + "`n... [TRUNCATED at $remaining chars, total $($content.Length) chars]"
         }
+        $scriptSummaries += "--- $($s.RelPath) ($($content.Length) chars) ---`n$safe"
+        $totalChars += $safe.Length
     }
 
     $currentManifest = $Manifest | ConvertTo-Json -Depth 5
 
-    $prompt = @"
-You are an Intune Win32 app packaging expert. Analyze this application package and return a JSON object.
+    $systemPrompt = @"
+You are a senior Microsoft Intune packaging engineer. Your job is to analyze application packages and produce precise Win32 app configurations for deployment via Microsoft Intune.
 
-## Files in package:
+## Your expertise includes:
+- Identifying the correct setup file (entry point) in multi-file packages
+- Determining silent install/uninstall command lines for MSI, EXE, BAT, PS1 installers
+- Designing reliable detection rules that confirm the app IS installed (not just that files exist)
+- Understanding how scripts modify Windows: registry writes, file copies, service installations, scheduled tasks
+
+## Critical rules for detection:
+- Detection rules must verify the OUTCOME of the installation, not prerequisites
+- For scripts that write registry keys, identify the MOST SPECIFIC key/value the script creates or modifies
+- Prefer registry detection over file detection when the script writes to the registry
+- If the script sets a registry value to a specific number (e.g., 1), use integerComparison with operator "equal"
+- If the script just creates a key, use "exists"
+- NEVER use generic OS registry keys (like HKLM\Hardware) as detection — these always exist
+- The keyPath must use full format: HKEY_LOCAL_MACHINE\... (not HKLM:\...)
+
+## Critical rules for install commands:
+- For .bat/.cmd files: use "cmd.exe /c <filename>" to ensure proper execution and exit code propagation
+- For .ps1 files: use "powershell.exe -ExecutionPolicy Bypass -File <filename>"
+- For .msi files: use "msiexec /i <filename> /qn /norestart"
+- For .exe files: determine the installer framework (NSIS, InnoSetup, InstallShield, WiX) and use appropriate silent switches
+- If a .bat launcher calls a .ps1 script, the .bat is the entry point (not the .ps1)
+
+## Critical rules for uninstall:
+- If the package has no uninstall capability, use: cmd.exe /c echo No uninstall available
+- For MSI: msiexec /x {ProductCode} /qn /norestart
+- Never invent an uninstall command that doesn't exist in the package
+"@
+
+    $prompt = @"
+Analyze this application package for Intune Win32 app deployment.
+
+## File inventory:
 $fileList
 
-## Script contents (redacted):
+## Script/file contents:
 $($scriptSummaries -join "`n`n")
 
-## Current heuristic analysis:
+## Current heuristic analysis (may be inaccurate):
 $currentManifest
 
-## Your task:
-Return ONLY a JSON object with these fields. Improve upon the heuristic analysis:
+## Instructions:
+1. READ the script contents carefully. Identify what the scripts DO (not just what files exist).
+2. Trace the execution flow: which file is the entry point? What does it call? What registry keys does it write?
+3. Identify the BEST detection rule — a registry key/value that ONLY exists AFTER this script runs successfully.
+4. Determine the correct install command line based on the entry point file type.
+5. Check if an uninstall routine exists in the package.
+
+## Return ONLY a valid JSON object:
 {
-  "displayName": "Human-friendly app name",
-  "publisher": "Publisher/vendor name",
-  "description": "What this app/script does (1-2 sentences)",
-  "installCommandLine": "Silent install command",
-  "uninstallCommandLine": "Silent uninstall command",
+  "displayName": "Human-friendly app name based on script purpose",
+  "publisher": "Publisher/vendor (read from script headers or metadata)",
+  "description": "What this package does when installed (1-2 sentences)",
+  "installCommandLine": "Exact silent install command",
+  "uninstallCommandLine": "Exact silent uninstall command or placeholder",
   "detectionType": "registry|file|productCode",
   "detectionRules": [
     {
-      "type": "registry|file|productCode",
-      "keyPath": "for registry",
-      "valueName": "for registry",
+      "type": "registry",
+      "keyPath": "HKEY_LOCAL_MACHINE\\full\\path\\to\\key",
+      "valueName": "ValueName",
       "operator": "exists|equal|greaterThanOrEqual",
-      "comparisonValue": "if needed",
-      "path": "for file detection",
-      "fileOrFolderName": "for file detection",
-      "productCode": "for MSI",
-      "productVersion": "for MSI"
+      "comparisonValue": "value if using equal/comparison, omit for exists"
     }
   ],
   "minOS": "1803|1903|2004|21H1|21H2|22H2",
   "architecture": "x64|x86|all",
   "confidence": "high|medium|low",
-  "reasoning": "Brief explanation of your choices"
+  "reasoning": "Step-by-step explanation: 1) entry point identification 2) execution flow 3) detection rule justification"
 }
 "@
 
     try {
         $aiBody = @{
             messages = @(
-                @{ role = "system"; content = "You are an expert in Microsoft Intune Win32 app packaging. Return only valid JSON." }
+                @{ role = "system"; content = $systemPrompt }
                 @{ role = "user"; content = $prompt }
             )
             temperature = 0.1
@@ -612,10 +659,16 @@ function Deploy-ToIntune {
     $encSize = (Get-Item $tmpFile).Length
 
     # Create content file
+    $cfBody = @{
+        "@odata.type"  = "#microsoft.graph.mobileAppContentFile"
+        name           = $Manifest.Install.SetupFile
+        size           = [int64]$fileSize
+        sizeEncrypted  = [int64]$encSize
+        isDependency   = $false
+    } | ConvertTo-Json
     $cf = Invoke-MgGraphRequest -Method POST `
         -Uri "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
-        -Body (@{ "@odata.type"="#microsoft.graph.mobileAppContentFile"; name=$Manifest.Install.SetupFile; size=$fileSize; sizeEncrypted=$encSize; isDependency=$false } | ConvertTo-Json) `
-        -ContentType "application/json"
+        -Body $cfBody -ContentType "application/json"
     $cfId = $cf.id
 
     # Wait for SAS URI

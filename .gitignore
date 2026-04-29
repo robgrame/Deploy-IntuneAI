@@ -1,0 +1,15 @@
+# IntuneWinAppUtil.exe is auto-downloaded
+IntuneWinAppUtil.exe
+
+# Output folders
+IntunePackage/
+*.intunewin
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+*~
